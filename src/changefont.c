@@ -14,10 +14,36 @@
 
 #define MAX_KEY_LENGTH 255
 #define MAX_VALUE_NAME 16383
+#define MAX_VALUE_DATA 16383
+
+void sb_append_escaped(String_Builder* sb, const char* string) {
+    size_t string_len = strlen(string);
+    for (size_t i = 0; i < string_len; ++i) {
+        char chr = string[i];
+        switch (chr) {
+        case '\\':
+            sb_append_cstr(sb, "\\\\");
+            break;
+        case '\n':
+            sb_append_cstr(sb, "\\n");
+            break;
+        default:
+            da_append(sb, chr);
+            break;
+        }
+    }
+}
+
+typedef enum {
+    REG_TYPE_STRING,
+    REG_TYPE_HEX,
+} Registry_Value_Type;
 
 typedef struct {
     char* name;
     size_t name_len;
+    Registry_Value_Type type;
+    DWORD type_hex_type;
     char* data;
     size_t data_len;
 } Registry_Value;
@@ -30,10 +56,10 @@ typedef struct {
 
 bool reg_key_list_values(HKEY parent_key, Registry_Value_List* result) {
     char value_name[MAX_VALUE_NAME];
-    unsigned char value_data[MAX_PATH+1];
+    unsigned char value_data[MAX_VALUE_DATA+1];
     DWORD amount_of_values = 0;
 
-    int code = RegQueryInfoKeyA(parent_key, NULL, NULL, NULL, NULL /*Amount of values*/, NULL, NULL, &amount_of_values, NULL, NULL, NULL, NULL);
+    int code = RegQueryInfoKeyA(parent_key, NULL, NULL, NULL, NULL /*Amount of subkeys*/, NULL, NULL, &amount_of_values, NULL, NULL, NULL, NULL);
     if (code != ERROR_SUCCESS) {
         nob_log(NOB_ERROR, "Couldn't query registry key info: %ld", GetLastError());
         return false;
@@ -44,26 +70,65 @@ bool reg_key_list_values(HKEY parent_key, Registry_Value_List* result) {
 
         DWORD value_len = MAX_VALUE_NAME;
         DWORD value_type;
-        DWORD data_len = MAX_PATH;
+        DWORD data_len = MAX_VALUE_DATA;
         code = RegEnumValueA(parent_key, i, value_name, &value_len, NULL, &value_type, value_data, &data_len);
-        if (code != ERROR_SUCCESS) return false;
+        if (code != ERROR_SUCCESS) {
+            nob_log(NOB_ERROR, "Couldn't enumerate value %ld of %ld: %ld", i, amount_of_values, code);
+            return false;
+        }
         key.name_len = value_len;
         key.name = malloc(sizeof(*value_name) * (value_len + 1));
         memcpy(key.name, value_name, sizeof(*value_name) * value_len);
         // Ensure the name is null-terminated
         key.name[value_len] = 0;
 
+        key.data_len = data_len;
+        key.data = malloc(sizeof(*value_data) * (data_len + 1));
+        memcpy(key.data, value_data, sizeof(*value_data) * data_len);
+        // Ensure the name is null-terminated
+        key.data[data_len] = 0;
         if (value_type == REG_SZ) {
-            key.data_len = data_len;
-            key.data = malloc(sizeof(*value_data) * (data_len + 1));
-            memcpy(key.data, value_data, sizeof(*value_data) * data_len);
-            // Ensure the name is null-terminated
-            key.data[data_len] = 0;
+            key.type = REG_TYPE_STRING;
+        } else {
+            key.type = REG_TYPE_HEX;
+            key.type_hex_type = value_type;
         }
 
         da_append(result, key);
     }
 
+    return true;
+}
+
+void reg_sb_append_hex(String_Builder* sb, const Registry_Value* value) {
+    sb_append_cstr(sb, temp_sprintf("hex(%ld):", value->type_hex_type));
+    for (size_t i = 0; i < value->data_len; ++i) {
+        if (i > 0)
+            da_append(sb, ',');
+        sb_append_cstr(sb, temp_sprintf("%x", value->data[i]));
+    }
+}
+
+bool reg_key_get_file(const char* registry_path, const Registry_Value_List list, String_Builder* sb) {
+    sb->count = 0;
+    sb_append_cstr(sb, "Windows Registry Editor Version 5.00\n\n");
+    sb_append_cstr(sb, temp_sprintf("[HKEY_LOCAL_MACHINE\\%s]\n", registry_path));
+    for (size_t i = 0; i < list.count; ++i) {
+        sb_append_cstr(sb, "\"");
+        sb_append_escaped(sb, list.items[i].name);
+        sb_append_cstr(sb, "\"=");
+        switch (list.items[i].type) {
+        case REG_TYPE_STRING:
+            sb_append_cstr(sb, "\"");
+            sb_append_escaped(sb, list.items[i].data);
+            sb_append_cstr(sb, "\"");
+            break;
+        case REG_TYPE_HEX:
+            reg_sb_append_hex(sb, &list.items[i]);
+            break;
+        }
+        sb_append_cstr(sb, "\n");
+    }
     return true;
 }
 
@@ -105,29 +170,15 @@ bool str_contains(const char* haystack, const char* needle) {
 }
 
 #define FONTS_REGISTRY_PATH "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"
+// #define FONTLINK_REGISTRY_PATH "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink"
 
-#define BACKUP_REG_FILENAME "backup.reg"
-
-void sb_append_escaped(String_Builder* sb, const char* string) {
-    size_t string_len = strlen(string);
-    for (size_t i = 0; i < string_len; ++i) {
-        char chr = string[i];
-        switch (chr) {
-        case '\\':
-            sb_append_cstr(sb, "\\\\");
-            break;
-        case '\n':
-            sb_append_cstr(sb, "\\n");
-            break;
-        default:
-            da_append(sb, chr);
-            break;
-        }
-    }
-}
+#define BACKUP_FONTS_REG_FILENAME "backup_fonts.reg"
+// #define BACKUP_FONTLINK_REG_FILENAME "backup_fontlink.reg"
 
 int main() {
     int result = 0;
+    HKEY fonts_key = 0;
+    // HKEY fontlink_key = 0;
 
     if (!util_is_admin()) {
         nob_log(NOB_ERROR, "You need to run this tool with Administrator privileges!");
@@ -139,7 +190,7 @@ int main() {
     DWORD error = GetLastError();
     if (error != ERROR_SUCCESS) {
         nob_log(NOB_ERROR, "Couldn't get module file name: %ld", error);
-        return 1;
+        return_defer(1);
     }
     for (int i = exe_dir_len - 1; i >= 0; --i) {
         if (exe_dir[i] == '\\') {
@@ -148,19 +199,23 @@ int main() {
         }
     }
 
-    if (file_exists(temp_sprintf("%s/%s", exe_dir, BACKUP_REG_FILENAME))) {
-        nob_log(NOB_ERROR, "A backup already exists!");
-        TODO("Implement backup restore");
-        return 1;
-    }
-
-    HKEY fonts_key = 0;
     long code = RegOpenKeyExA(HKEY_LOCAL_MACHINE, FONTS_REGISTRY_PATH, 0, KEY_READ, &fonts_key);
-    if (code != ERROR_SUCCESS) return_defer(1);
-
+    if (code != ERROR_SUCCESS) {
+        nob_log(NOB_ERROR, "Failed to open key %s: %ld", FONTS_REGISTRY_PATH, code);
+        return_defer(40);
+    }
     Registry_Value_List font_list = {0};
     if (!reg_key_list_values(fonts_key, &font_list)) return_defer(1);
     nob_log(NOB_INFO, "Amount of fonts: %zu", font_list.count);
+
+    // code = RegOpenKeyExA(HKEY_LOCAL_MACHINE, FONTLINK_REGISTRY_PATH, 0, KEY_READ, &fontlink_key);
+    // if (code != ERROR_SUCCESS) {
+    //     nob_log(NOB_ERROR, "Failed to open key %s: %ld", FONTLINK_REGISTRY_PATH, code);
+    //     return_defer(41);
+    // }
+    // Registry_Value_List fontlink_list = {0};
+    // if (!reg_key_list_values(fontlink_key, &fontlink_list)) return_defer(1);
+    // nob_log(NOB_INFO, "Amount of font links: %zu", fontlink_list.count);
 
     printf("Now, you will choose a font to replace all other fonts with.\n");
     printf("The amount of fonts is probably too high to list them now.\nThat's why you can search through them.\n");
@@ -209,25 +264,46 @@ retry_number_query:
     if (tolower(query[0]) != 'y') return 0;
 
 
-    String_Builder backup_sb = {0};
+    String_Builder font_reg = {0};
 
-    sb_append_cstr(&backup_sb, "Windows Registry Editor Version 5.00\n\n");
-    sb_append_cstr(&backup_sb, "[HKEY_LOCAL_MACHINE\\"FONTS_REGISTRY_PATH"]\n");
-    for (size_t i = 0; i < font_list.count; ++i) {
-        sb_append_cstr(&backup_sb, "\"");
-        sb_append_escaped(&backup_sb, font_list.items[i].name);
-        sb_append_cstr(&backup_sb, "\"=\"");
-        sb_append_escaped(&backup_sb, font_list.items[i].data);
-        sb_append_cstr(&backup_sb, "\"\n");
+    if (file_exists(temp_sprintf("%s/%s", exe_dir, BACKUP_FONTS_REG_FILENAME))
+    //  || file_exists(temp_sprintf("%s/%s", exe_dir, BACKUP_FONTLINK_REG_FILENAME))
+    ) {
+        nob_log(NOB_WARNING, "A backup already exists! Not overwriting the file.");
+    } else {
+        if (!reg_key_get_file(FONTS_REGISTRY_PATH, font_list, &font_reg)) return 1;
+        char* fonts_backup_file_path = temp_sprintf("%s/%s", exe_dir, BACKUP_FONTS_REG_FILENAME);
+        if (!write_entire_file(fonts_backup_file_path, font_reg.items, font_reg.count)) return false;
+        nob_log(NOB_INFO, "Wrote fonts backup file to %s", fonts_backup_file_path);
+        temp_reset();
+
+        // font_reg.count = 0;
+        // if (!reg_key_get_file(FONTLINK_REGISTRY_PATH, fontlink_list, &font_reg)) return 1;
+        // char* backup_file_path = temp_sprintf("%s/%s", exe_dir, BACKUP_FONTLINK_REG_FILENAME);
+        // if (!write_entire_file(backup_file_path, font_reg.items, font_reg.count)) return false;
+        // nob_log(NOB_INFO, "Wrote font link backup file to %s", backup_file_path);
+        // temp_reset();
     }
-    char* backup_file_path = temp_sprintf("%s/%s", exe_dir, BACKUP_REG_FILENAME);
-    if (!write_entire_file(backup_file_path, backup_sb.items, backup_sb.count)) return 1;
-    nob_log(NOB_INFO, "Wrote backup file to %s", backup_file_path);
+
+    for (size_t i = 0; i < font_list.count; ++i) {
+        font_list.items[i].data = font_list.items[font_index].data;
+        font_list.items[i].data_len = font_list.items[font_index].data_len;
+    }
+
+    if (!reg_key_get_file(FONTS_REGISTRY_PATH, font_list, &font_reg)) return 1;
+    char* fonts_backup_file_path = temp_sprintf("%s/fonts_%s.reg", exe_dir, font_list.items[font_index].name);
+    if (!write_entire_file(fonts_backup_file_path, font_reg.items, font_reg.count)) return false;
+    nob_log(NOB_INFO, "Wrote fonts registry file to %s", fonts_backup_file_path);
     temp_reset();
 
-    TODO("implement font changing");
+    printf("\n\n");
+    printf("You can now import the generated fonts_%s.reg file.\n", font_list.items[font_index].name);
+    printf("To restore things to normal, import the "BACKUP_FONTS_REG_FILENAME" file.\n");
+    printf("Have fun!\n");
+    printf("\n");
 
 defer:
     if (fonts_key) RegCloseKey(fonts_key);
+    // if (fontlink_key) RegCloseKey(fontlink_key);
     return result;
 }
