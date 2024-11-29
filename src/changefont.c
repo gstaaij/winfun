@@ -37,6 +37,7 @@ void sb_append_escaped(String_Builder* sb, const char* string) {
 typedef enum {
     REG_TYPE_STRING,
     REG_TYPE_HEX,
+    REG_TYPE_DELETE,
 } Registry_Value_Type;
 
 typedef struct {
@@ -109,9 +110,8 @@ void reg_sb_append_hex(String_Builder* sb, const Registry_Value* value) {
     }
 }
 
-bool reg_key_get_file(const char* registry_path, const Registry_Value_List list, String_Builder* sb) {
-    sb->count = 0;
-    sb_append_cstr(sb, "Windows Registry Editor Version 5.00\n\n");
+bool reg_key_add_to_file(const char* registry_path, const Registry_Value_List list, String_Builder* sb) {
+    sb_append_cstr(sb, "\n");
     sb_append_cstr(sb, temp_sprintf("[HKEY_LOCAL_MACHINE\\%s]\n", registry_path));
     for (size_t i = 0; i < list.count; ++i) {
         sb_append_cstr(sb, "\"");
@@ -126,10 +126,19 @@ bool reg_key_get_file(const char* registry_path, const Registry_Value_List list,
         case REG_TYPE_HEX:
             reg_sb_append_hex(sb, &list.items[i]);
             break;
+        case REG_TYPE_DELETE:
+            da_append(sb, '-');
+            break;
         }
         sb_append_cstr(sb, "\n");
     }
     return true;
+}
+
+bool reg_key_get_file(const char* registry_path, const Registry_Value_List list, String_Builder* sb) {
+    sb->count = 0;
+    sb_append_cstr(sb, "Windows Registry Editor Version 5.00\n");
+    return reg_key_add_to_file(registry_path, list, sb);
 }
 
 bool util_is_admin() {
@@ -170,7 +179,8 @@ bool str_contains(const char* haystack, const char* needle) {
 }
 
 #define FONTS_REGISTRY_PATH "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"
-// #define FONTLINK_REGISTRY_PATH "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink"
+#define FONT_SUBSTITUTES_REGISTRY_PATH "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontSubstitutes"
+#define FONT_LINK_REGISTRY_PATH "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink"
 
 #define BACKUP_FONTS_REG_FILENAME "backup_fonts.reg"
 // #define BACKUP_FONTLINK_REG_FILENAME "backup_fontlink.reg"
@@ -178,12 +188,13 @@ bool str_contains(const char* haystack, const char* needle) {
 int main() {
     int result = 0;
     HKEY fonts_key = 0;
-    // HKEY fontlink_key = 0;
+    HKEY font_substitutes_key = 0;
+    HKEY font_link_key = 0;
 
-    if (!util_is_admin()) {
-        nob_log(NOB_ERROR, "You need to run this tool with Administrator privileges!");
-        return_defer(10);
-    }
+    // if (!util_is_admin()) {
+    //     nob_log(NOB_ERROR, "You need to run this tool with Administrator privileges!");
+    //     return_defer(10);
+    // }
 
     char exe_dir[MAX_PATH];
     DWORD exe_dir_len = GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
@@ -208,14 +219,14 @@ int main() {
     if (!reg_key_list_values(fonts_key, &font_list)) return_defer(1);
     nob_log(NOB_INFO, "Amount of fonts: %zu", font_list.count);
 
-    // code = RegOpenKeyExA(HKEY_LOCAL_MACHINE, FONTLINK_REGISTRY_PATH, 0, KEY_READ, &fontlink_key);
-    // if (code != ERROR_SUCCESS) {
-    //     nob_log(NOB_ERROR, "Failed to open key %s: %ld", FONTLINK_REGISTRY_PATH, code);
-    //     return_defer(41);
-    // }
-    // Registry_Value_List fontlink_list = {0};
-    // if (!reg_key_list_values(fontlink_key, &fontlink_list)) return_defer(1);
-    // nob_log(NOB_INFO, "Amount of font links: %zu", fontlink_list.count);
+    code = RegOpenKeyExA(HKEY_LOCAL_MACHINE, FONT_LINK_REGISTRY_PATH, 0, KEY_READ, &font_link_key);
+    if (code != ERROR_SUCCESS) {
+        nob_log(NOB_ERROR, "Failed to open key %s: %ld", FONT_LINK_REGISTRY_PATH, code);
+        return_defer(41);
+    }
+    Registry_Value_List font_link_list = {0};
+    if (!reg_key_list_values(font_link_key, &font_link_list)) return_defer(1);
+    nob_log(NOB_INFO, "Amount of font links: %zu", font_link_list.count);
 
     printf("Now, you will choose a font to replace all other fonts with.\n");
     printf("The amount of fonts is probably too high to list them now.\nThat's why you can search through them.\n");
@@ -255,30 +266,64 @@ retry_number_query:
     }
     
     printf("\n");
-    nob_log(NOB_WARNING, "This will replace ALL fonts with `%s`.", font_list.items[font_index].name);
-    nob_log(NOB_WARNING, "A backup will be created and can be restored later.");
+    printf("This will create a .reg file to replace ALL fonts with `%s`.\n", font_list.items[font_index].name);
+    printf("A backup .reg file will be created and can be restored later.\n");
     memset(query, 0, sizeof(*query) * QUERY_MAX_LEN);
     printf("Are you SURE you want to continue? [y/N] ");
     fgets(query, QUERY_MAX_LEN, stdin);
 
     if (tolower(query[0]) != 'y') return 0;
 
+    Registry_Value_List font_substitute_list = {0};
+
+    for (size_t i = 0; i < font_list.count; ++i) {
+        Registry_Value val = {
+            .name = malloc(sizeof(char) * font_list.items[i].name_len),
+            .name_len = font_list.items[i].name_len,
+            .data = NULL,
+            .data_len = 0,
+            .type = REG_TYPE_DELETE,
+        };
+
+        memcpy(val.name, font_list.items[i].name, sizeof(char) * font_list.items[i].name_len);
+        while (val.name[val.name_len - 1] == '\0') --val.name_len;
+        
+        if (val.name[val.name_len - 1] == ')') {
+            while (val.name_len > 0 && val.name[val.name_len - 1] != '(')
+                --val.name_len;
+            --val.name_len;
+            if (val.name_len > 0 && val.name[val.name_len - 1] == ' ')
+                --val.name_len;
+        }
+        val.name[val.name_len] = '\0';
+
+        da_append(&font_substitute_list, val);
+    }
+
+    code = RegOpenKeyExA(HKEY_LOCAL_MACHINE, FONT_SUBSTITUTES_REGISTRY_PATH, 0, KEY_READ, &font_substitutes_key);
+    if (code != ERROR_SUCCESS) {
+        nob_log(NOB_ERROR, "Failed to open key %s: %ld", FONT_SUBSTITUTES_REGISTRY_PATH, code);
+        return_defer(40);
+    }
+    if (!reg_key_list_values(font_substitutes_key, &font_substitute_list)) return_defer(1);
+    nob_log(NOB_INFO, "Amount of font substitutes: %zu", font_substitute_list.count);
 
     String_Builder font_reg = {0};
 
     if (file_exists(temp_sprintf("%s/%s", exe_dir, BACKUP_FONTS_REG_FILENAME))
-    //  || file_exists(temp_sprintf("%s/%s", exe_dir, BACKUP_FONTLINK_REG_FILENAME))
     ) {
         nob_log(NOB_WARNING, "A backup already exists! Not overwriting the file.");
     } else {
         if (!reg_key_get_file(FONTS_REGISTRY_PATH, font_list, &font_reg)) return 1;
+        if (!reg_key_add_to_file(FONT_SUBSTITUTES_REGISTRY_PATH, font_substitute_list, &font_reg)) return 1;
+        if (!reg_key_add_to_file(FONT_LINK_REGISTRY_PATH, font_link_list, &font_reg)) return 1;
         char* fonts_backup_file_path = temp_sprintf("%s/%s", exe_dir, BACKUP_FONTS_REG_FILENAME);
         if (!write_entire_file(fonts_backup_file_path, font_reg.items, font_reg.count)) return false;
         nob_log(NOB_INFO, "Wrote fonts backup file to %s", fonts_backup_file_path);
         temp_reset();
 
         // font_reg.count = 0;
-        // if (!reg_key_get_file(FONTLINK_REGISTRY_PATH, fontlink_list, &font_reg)) return 1;
+        // if (!reg_key_get_file(FONTLINK_REGISTRY_PATH, font_link_list, &font_reg)) return 1;
         // char* backup_file_path = temp_sprintf("%s/%s", exe_dir, BACKUP_FONTLINK_REG_FILENAME);
         // if (!write_entire_file(backup_file_path, font_reg.items, font_reg.count)) return false;
         // nob_log(NOB_INFO, "Wrote font link backup file to %s", backup_file_path);
@@ -286,11 +331,23 @@ retry_number_query:
     }
 
     for (size_t i = 0; i < font_list.count; ++i) {
-        font_list.items[i].data = font_list.items[font_index].data;
-        font_list.items[i].data_len = font_list.items[font_index].data_len;
+        if (i == (size_t) font_index) continue;
+        font_list.items[i].data = "";
+        font_list.items[i].data_len = 0;
+    }
+    for (size_t i = 0; i < font_substitute_list.count; ++i) {
+        if (i == (size_t) font_index) continue;
+        font_substitute_list.items[i].data = font_substitute_list.items[font_index].name;
+        font_substitute_list.items[i].data_len = font_substitute_list.items[font_index].name_len;
+        font_substitute_list.items[i].type = REG_TYPE_STRING;
+    }
+    for (size_t i = 0; i < font_link_list.count; ++i) {
+        font_link_list.items[i].type = REG_TYPE_DELETE;
     }
 
     if (!reg_key_get_file(FONTS_REGISTRY_PATH, font_list, &font_reg)) return 1;
+    if (!reg_key_add_to_file(FONT_SUBSTITUTES_REGISTRY_PATH, font_substitute_list, &font_reg)) return 1;
+    if (!reg_key_add_to_file(FONT_LINK_REGISTRY_PATH, font_link_list, &font_reg)) return 1;
     char* fonts_backup_file_path = temp_sprintf("%s/fonts_%s.reg", exe_dir, font_list.items[font_index].name);
     if (!write_entire_file(fonts_backup_file_path, font_reg.items, font_reg.count)) return false;
     nob_log(NOB_INFO, "Wrote fonts registry file to %s", fonts_backup_file_path);
@@ -304,6 +361,7 @@ retry_number_query:
 
 defer:
     if (fonts_key) RegCloseKey(fonts_key);
-    // if (fontlink_key) RegCloseKey(fontlink_key);
+    if (font_substitutes_key) RegCloseKey(font_substitutes_key);
+    if (font_link_key) RegCloseKey(font_link_key);
     return result;
 }
